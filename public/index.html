@@ -1,123 +1,93 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="UTF-8">
-<title>http stt site</title>
+<meta charset="utf-8">
+<title>Mic Stream Test</title>
 <style>
-body { font-family: sans-serif; max-width: 600px; margin: 1rem auto; text-align: center; }
-button { padding: 10px 20px; margin: 10px; font-size: 1rem; }
-#log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1em; height: 200px; overflow-y: auto; text-align: left; }
+body { font-family: sans-serif; padding: 1rem; max-width: 600px; margin: auto; text-align: center; }
+button { margin: 0.5rem; padding: 0.5rem 1rem; font-size: 16px; }
+#log { text-align: left; background: #111; color: #0f0; padding: 1rem; height: 200px; overflow-y: auto; white-space: pre-wrap; }
 </style>
 </head>
 <body>
-<h2>Dubix stt</h2>
-<p>This page simulates the ESP32 client using AudioWorklet.</p>
-<button id="startBtn">🎙️ Start</button>
-<button id="stopBtn" disabled>🛑 Stop</button>
-<div id="log"></div>
+<h2>🎙️ ESP32 Mic Stream Test</h2>
+<button id="start">Start Mic Stream</button>
+<button id="stop">Stop</button>
+<pre id="log"></pre>
 
 <script>
-const id = 'browser';
-const sampleRate = 16000;
-let audioCtx, processorNode, mediaStream, stopped = false;
-const logBox = document.getElementById('log');
-const startBtn = document.getElementById('startBtn');
-const stopBtn = document.getElementById('stopBtn');
+const log = (m) => {
+  document.getElementById('log').textContent += m + "\n";
+};
 
-function log(msg) {
-  logBox.textContent += msg + '\n';
-  logBox.scrollTop = logBox.scrollHeight;
-}
-
-// === AudioWorklet Processor ===
-const workletCode = `
-class PCMProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this._buffer = [];
-    this._frameCount = 0;
-  }
-
-  process(inputs) {
-    const input = inputs[0];
-    if (!input || !input[0]) return true;
-    const channelData = input[0];
-    const buffer = new ArrayBuffer(channelData.length * 2);
-    const view = new DataView(buffer);
-    for (let i = 0; i < channelData.length; i++) {
-      let s = Math.max(-1, Math.min(1, channelData[i]));
-      view.setInt16(i * 2, s * 0x7fff, true);
-    }
-    this.port.postMessage(buffer);
-    return true;
-  }
-}
-registerProcessor('pcm-processor', PCMProcessor);
-`;
+let audioContext, processor, micStream, stopped = false;
+const STREAM_URL = '/stream?sample_rate=16000';
+const POLL_URL = '/transcript';
 
 async function start() {
   stopped = false;
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-  log('Requesting mic access...');
-
-  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  audioCtx = new AudioContext({ sampleRate });
-
+  log("🎧 Requesting mic...");
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioContext = new AudioContext({ sampleRate: 16000 });
+  micStream = audioContext.createMediaStreamSource(stream);
+  
+  const workletCode = `
+    class PCMWorklet extends AudioWorkletProcessor {
+      constructor() { super(); this.buf = []; this.lastSend = 0; }
+      process(inputs) {
+        const input = inputs[0][0];
+        if (!input) return true;
+        const pcm = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          let s = Math.max(-1, Math.min(1, input[i]));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        this.port.postMessage(pcm.buffer);
+        return true;
+      }
+    }
+    registerProcessor('pcm-worklet', PCMWorklet);
+  `;
+  
   const blob = new Blob([workletCode], { type: 'application/javascript' });
-  const workletURL = URL.createObjectURL(blob);
-  await audioCtx.audioWorklet.addModule(workletURL);
-
-  const source = audioCtx.createMediaStreamSource(mediaStream);
-  processorNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
-  source.connect(processorNode);
-  processorNode.connect(audioCtx.destination);
-
-  processorNode.port.onmessage = async (e) => {
+  const url = URL.createObjectURL(blob);
+  await audioContext.audioWorklet.addModule(url);
+  processor = new AudioWorkletNode(audioContext, 'pcm-worklet');
+  processor.port.onmessage = async (e) => {
     if (stopped) return;
-    const pcmChunk = e.data;
     try {
-      await fetch(`/stream?id=${id}&sample_rate=${sampleRate}`, {
+      await fetch(STREAM_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
-        body: pcmChunk
+        body: e.data
       });
-    } catch (err) {
-      log('POST failed: ' + err);
-    }
+    } catch (err) { log("⚠️ " + err.message); }
   };
-
-  log('🎙️ Mic started streaming...');
+  micStream.connect(processor).connect(audioContext.destination);
+  log("🎤 Streaming started...");
   pollTranscript();
 }
 
-async function stop() {
+function stop() {
   stopped = true;
-  stopBtn.disabled = true;
-  startBtn.disabled = false;
-  if (processorNode) processorNode.disconnect();
-  if (audioCtx) await audioCtx.close();
-  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-  log('🛑 Mic stopped.');
+  if (audioContext) audioContext.close();
+  log("🛑 Mic stopped.");
 }
 
 async function pollTranscript() {
-  while (!stopped) {
-    try {
-      const resp = await fetch(`/transcript?id=${id}`);
-      const data = await resp.json();
-      if (data.ready && data.transcript) {
-        log('📝 Transcript: ' + data.transcript);
-      }
-    } catch (err) {
-      log('Poll error: ' + err);
+  if (stopped) return;
+  try {
+    const res = await fetch(POLL_URL);
+    const j = await res.json();
+    if (j.ready && j.transcript) {
+      log("🗣️ " + j.transcript);
     }
-    await new Promise(r => setTimeout(r, 1000));
-  }
+  } catch (err) {}
+  setTimeout(pollTranscript, 1000);
 }
 
-startBtn.onclick = start;
-stopBtn.onclick = stop;
+document.getElementById('start').onclick = start;
+document.getElementById('stop').onclick = stop;
 </script>
 </body>
 </html>
