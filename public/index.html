@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>https wakeword site</title>
+<title>speech to text site</title>
 <style>
 body { font-family:sans-serif; max-width:600px; margin:1rem auto; text-align:center }
 button { padding:10px 15px; margin:5px; }
@@ -10,7 +10,7 @@ button { padding:10px 15px; margin:5px; }
 </style>
 </head>
 <body>
-<h2>dubix https wake word site</h2>
+<h2>dubix speech to text site</h2>
 <button id="startBtn">🎙 Start Stream</button>
 <button id="stopBtn">🛑 Stop Stream</button>
 <div id="log"></div>
@@ -21,7 +21,7 @@ const logEl = document.getElementById("log");
 
 function log(t){ logEl.textContent += t + "\n"; logEl.scrollTop = logEl.scrollHeight; }
 
-document.getElementById("startBtn").onclick = async () => {
+async function startStream() {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   audioCtx = new AudioContext({ sampleRate: 16000 });
   await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
@@ -56,17 +56,23 @@ document.getElementById("startBtn").onclick = async () => {
       log("🔁 WS Response: " + JSON.stringify(json, null, 2));
     }
   }, 3000);
+}
 
-  document.getElementById("stopBtn").onclick = () => {
-    clearInterval(interval);
-    if (source) source.disconnect();
-    if (workletNode) workletNode.disconnect();
-    if (audioCtx) audioCtx.close();
-    log("🛑 Stopped.");
-  };
+document.getElementById("startBtn").onclick = startStream;
+
+document.getElementById("stopBtn").onclick = () => {
+  clearInterval(interval);
+  if (workletNode) workletNode.disconnect();
+  if (audioCtx) audioCtx.close();
+  log("🛑 Stopped.");
 };
+
+// ✅ Auto-start on page load
+window.addEventListener("load", () => {
+  log("⚙️ Auto-starting stream...");
+  document.getElementById("startBtn").click();
+});
 </script>
 
 </body>
 </html>
-
