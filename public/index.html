@@ -1,1 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>https wakeword site</title>
+<style>
+body { font-family:sans-serif; max-width:600px; margin:1rem auto; text-align:center }
+button { padding:10px 15px; margin:5px; }
+#log { text-align:left; white-space:pre-wrap; background:#111; color:#0f0; padding:1em; height:200px; overflow:auto; }
+</style>
+</head>
+<body>
+<h2>dubix https wake word site</h2>
+<button id="startBtn">🎙 Start Stream</button>
+<button id="stopBtn">🛑 Stop Stream</button>
+<div id="log"></div>
+
+<script>
+let workletNode, audioCtx, interval;
+const logEl = document.getElementById("log");
+
+function log(t){ logEl.textContent += t + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+
+document.getElementById("startBtn").onclick = async () => {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioCtx = new AudioContext({ sampleRate: 16000 });
+  await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
+    class PCMWorklet extends AudioWorkletProcessor {
+      process(inputs, outputs, parameters) {
+        const input = inputs[0][0];
+        if (input) {
+          const pcm16 = new Int16Array(input.length);
+          for (let i = 0; i < input.length; i++) pcm16[i] = input[i] * 0x7fff;
+          this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
+        }
+        return true;
+      }
+    }
+    registerProcessor('pcm-worklet', PCMWorklet);
+  `], {type: 'application/javascript'})));
+
+  const source = audioCtx.createMediaStreamSource(stream);
+  workletNode = new AudioWorkletNode(audioCtx, 'pcm-worklet');
+  workletNode.port.onmessage = e => {
+    fetch("/stream", { method: "POST", body: e.data });
+  };
+
+  source.connect(workletNode);
+  workletNode.connect(audioCtx.destination);
+  log("🎤 Started capturing (AudioWorklet)...");
+
+  interval = setInterval(async () => {
+    const res = await fetch("/poll");
+    const json = await res.json();
+    if (json.length > 0) {
+      log("🔁 WS Response: " + JSON.stringify(json, null, 2));
+    }
+  }, 3000);
+
+  document.getElementById("stopBtn").onclick = () => {
+    clearInterval(interval);
+    if (source) source.disconnect();
+    if (workletNode) workletNode.disconnect();
+    if (audioCtx) audioCtx.close();
+    log("🛑 Stopped.");
+  };
+};
+</script>
+
+</body>
+</html>
 
