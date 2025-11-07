@@ -1,128 +1,151 @@
-// server.js
-import express from "express";
-import { WebSocket } from "ws";
-import { Buffer } from "buffer"; // explicit Buffer import for clarity
-import path from "path";
+import 'dotenv/config';
+import express from 'express';
+import fetch from 'node-fetch';
+import fs from 'fs';
+import path from 'path';
+import { tmpdir } from 'os';
+import https from 'https';
+import http from 'http';
 
 const app = express();
-app.use(express.static(path.join(process.cwd(), "public")));
+const PORT = process.env.PORT || 10000;
+const SILENCE_MS = parseInt(process.env.SILENCE_MS || '1200', 10);
+const DG_MODEL = process.env.DG_MODEL || 'nova-3';
+const DG_LANG = process.env.DG_LANG || 'en';
 
-// === CONFIG ===
-const WS_TARGET_URL = process.env.WS_URL || "wss://dubix-stt-proxy.onrender.com/ws";
-const PORT = process.env.PORT || 3000;
-
-let lastWsResponses = []; // array of JSON strings (or parsed objects if you prefer)
-
-// === WebSocket setup & reconnect ===
-let ws = null;
-function connectWS() {
-  console.log("[WS] Connecting to", WS_TARGET_URL);
-  ws = new WebSocket(WS_TARGET_URL);
-  ws.binaryType = "arraybuffer";
-
-  ws.on("open", () => console.log("[WS] Connected"));
-  ws.on("message", (data, isBinary) => {
-    // Responses from upstream are JSON-only as per your spec -> parse and store
-    if (!isBinary) {
-      try {
-        const txt = data.toString();
-        // store raw JSON string (or JSON.parse(txt) if you want objects)
-        lastWsResponses.push(txt);
-        console.log("[WS] Received JSON response (len:", txt.length + ")");
-      } catch (err) {
-        console.warn("[WS] Failed to parse incoming message:", err.message);
-      }
-    } else {
-      // ignore binary messages from upstream (per spec there shouldn't be any)
-      console.log("[WS] Ignored binary message from upstream (not expected)");
-    }
-  });
-
-  ws.on("close", (code, reason) => {
-    console.log(`[WS] Closed (${code}) - reconnecting in 2s`);
-    setTimeout(connectWS, 2000);
-  });
-
-  ws.on("error", (err) => {
-    console.error("[WS] Error:", err?.message || err);
-    // ws will emit close which triggers reconnect
-  });
+// === Create server (Render already terminates SSL) ===
+let server;
+if (fs.existsSync('cert.pem') && fs.existsSync('key.pem')) {
+  const options = {
+    cert: fs.readFileSync('cert.pem'),
+    key: fs.readFileSync('key.pem'),
+  };
+  server = https.createServer(options, app);
+  console.log('Running HTTPS (local SSL) server');
+} else {
+  server = http.createServer(app);
+  console.log('Running HTTP (Render-managed HTTPS)');
 }
-connectWS();
 
-// === POST /stream (collect binary manually) ===
-app.post("/stream", (req, res) => {
-  const clientId = req.headers["x-client-id"] || req.query.clientId || null;
-  const chunks = [];
-  let totalBytes = 0;
+server.listen(PORT, () => console.log(`Server listening on :${PORT}`));
 
-  req.on("data", (chunk) => {
-    // chunk will be a Buffer or Uint8Array — normalize to Buffer
-    const buf = Buffer.from(chunk);
-    chunks.push(buf);
-    totalBytes += buf.length;
-  });
+// === Memory stores ===
+const sessions = new Map();      // active streaming sessions
+const transcripts = new Map();   // saved transcripts for GET access
 
-  req.on("end", () => {
-    const body = Buffer.concat(chunks, totalBytes);
-    if (!body || body.length === 0) {
-      console.log("[HTTP] /stream received empty body");
-      return res.status(400).send("Empty body");
-    }
-
-    console.log(`[HTTP] /stream received ${body.length} bytes${clientId ? " for clientId="+clientId : ""}`);
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        // Send raw binary to upstream websocket
-        ws.send(body, { binary: true }, (err) => {
-          if (err) {
-            console.error("[WS] send error:", err.message || err);
-          }
-        });
-        // return success to uploader
-        res.status(200).json({ ok: true, bytes: body.length, clientId });
-      } catch (err) {
-        console.error("[WS] send exception:", err);
-        res.status(500).send("WebSocket send failed");
-      }
-    } else {
-      console.log("[HTTP] WebSocket not connected");
-      res.status(503).send("WebSocket not connected");
-    }
-  });
-
-  req.on("error", (err) => {
-    console.error("[HTTP] request error:", err.message || err);
-    res.status(500).send("Request error");
-  });
-});
-
-// === GET /poll (returns array of JSON strings, then clears) ===
-app.get("/poll", (req, res) => {
-  const clientId = req.query.clientId || "global";
-  // If you want per-client filtering, implement here (e.g., messages include clientId)
-  const out = lastWsResponses.slice(); // copy
-  // clear after serving
-  lastWsResponses = [];
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.status(200).send(JSON.stringify(out));
-});
-
-// Clear responses every 3 seconds (as requested)
-setInterval(() => {
-  if (lastWsResponses.length > 0) {
-    console.log("[CLEANUP] Clearing", lastWsResponses.length, "stored WS response(s)");
-    lastWsResponses = [];
+// === RMS calculation ===
+function calcRMS(buffer) {
+  let sumSq = 0;
+  const samples = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2);
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i] / 32768;
+    sumSq += s * s;
   }
-}, 5000);
+  return Math.sqrt(sumSq / samples.length);
+}
 
-// Health
-app.get("/health", (req, res) => {
-  res.json({ ok: true, wsConnected: ws && ws.readyState === WebSocket.OPEN });
+// === Stream endpoint ===
+// clients POST raw 16-bit PCM chunks repeatedly
+app.post('/stream', express.raw({ type: 'application/octet-stream', limit: '5mb' }), async (req, res) => {
+  const id = req.query.id || 'default';
+  const sampleRate = parseInt(req.query.sample_rate || '16000', 10);
+
+  if (!sessions.has(id)) {
+    sessions.set(id, {
+      audio: [],
+      lastHeard: Date.now(),
+      startedTalking: false,
+      rmsActiveTime: 0,
+      sampleRate,
+    });
+  }
+
+  const session = sessions.get(id);
+  const chunk = Buffer.from(req.body);
+  const rms = calcRMS(chunk);
+  const now = Date.now();
+
+  // Consider audio "active" if RMS > 0.02
+  if (rms > 0.02) {
+    session.lastHeard = now;
+    session.audio.push(chunk);
+    session.startedTalking = true;
+    session.rmsActiveTime += chunk.length / (sampleRate * 2) * 1000; // ms duration
+  } else {
+    // Before 2s active audio, keep recording
+    if (!session.startedTalking || session.rmsActiveTime < 2000) {
+      session.audio.push(chunk);
+      session.lastHeard = now;
+    }
+  }
+
+  // If silence detected and at least 2s active audio heard
+  if (session.startedTalking && now - session.lastHeard > SILENCE_MS) {
+    console.log(`[${id}] Silence detected -> finalizing`);
+    finalizeAndTranscribe(id);
+  }
+
+  res.json({ ok: true, rms });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT} (WS -> ${WS_TARGET_URL})`);
+// === GET transcript ===
+app.get('/transcript', (req, res) => {
+  const id = req.query.id || 'default';
+  const transcript = transcripts.get(id);
+  if (!transcript) {
+    return res.json({ transcript: '', ready: false });
+  }
+  res.json({ transcript, ready: true });
 });
+
+// === Manual finalize trigger (optional) ===
+app.get('/finalize', (req, res) => {
+  const id = req.query.id || 'default';
+  if (!sessions.has(id)) return res.status(404).send('No active session');
+  finalizeAndTranscribe(id);
+  res.send('Finalizing...');
+});
+
+// === Finalization and Deepgram transcription ===
+async function finalizeAndTranscribe(id) {
+  const session = sessions.get(id);
+  if (!session) return;
+
+  sessions.delete(id);
+  if (!session.audio.length) return console.log(`[${id}] No audio to process`);
+
+  const tmpFile = path.join(tmpdir(), `audio_${id}_${Date.now()}.raw`);
+  fs.writeFileSync(tmpFile, Buffer.concat(session.audio));
+
+  try {
+    const fileData = fs.readFileSync(tmpFile);
+
+    const resp = await fetch(
+      `https://api.deepgram.com/v1/listen?model=${DG_MODEL}&language=${DG_LANG}&encoding=linear16&sample_rate=${session.sampleRate}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
+          'Content-Type': 'application/octet-stream'
+        },
+        body: fileData
+      }
+    );
+
+    const json = await resp.json();
+    const transcript = json?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '';
+
+    console.log(`[${id}] Transcript:`, transcript);
+
+    // Store transcript for retrieval
+    transcripts.set(id, transcript);
+
+    // Auto-clear after 5 seconds
+    setTimeout(() => transcripts.delete(id), 5000);
+
+  } catch (err) {
+    console.error(`[${id}] Deepgram error:`, err);
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+}
