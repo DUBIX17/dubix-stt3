@@ -1,154 +1,121 @@
-import 'dotenv/config';
-import express from 'express';
-import fetch from 'node-fetch';
-import fs from 'fs';
-import path from 'path';
-import { tmpdir } from 'os';
-import https from 'https';
-import http from 'http';
+// server.js
+import express from "express";
+import { WebSocket } from "ws";
+import { Buffer } from "buffer";
+import path from "path";
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-const SILENCE_MS = parseInt(process.env.SILENCE_MS || '1200', 10);
-const DG_MODEL = process.env.DG_MODEL || 'nova-3';
-const DG_LANG = process.env.DG_LANG || 'en';
+app.use(express.static(path.join(process.cwd(), "public")));
 
-// === Create HTTP or HTTPS server ===
-let server;
-if (fs.existsSync('cert.pem') && fs.existsSync('key.pem')) {
-  const options = {
-    cert: fs.readFileSync('cert.pem'),
-    key: fs.readFileSync('key.pem'),
-  };
-  server = https.createServer(options, app);
-  console.log('Running local HTTPS server');
-} else {
-  server = http.createServer(app);
-  console.log('Running HTTP (Render-managed HTTPS)');
-}
+// === CONFIG ===
+const WS_TARGET_URL = process.env.WS_URL || "wss://dubix-stt-proxy.onrender.com/ws";
+const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
+// Only keep the *latest* WS response
+let lastWsResponse = null;
+let clearTimeoutHandle = null;
 
-// === Memory stores ===
-const sessions = new Map();      // active sessions with chunks
-const transcripts = new Map();   // recent transcripts
+// === WebSocket setup & reconnect ===
+let ws = null;
+function connectWS() {
+  console.log("[WS] Connecting to", WS_TARGET_URL);
+  ws = new WebSocket(WS_TARGET_URL);
+  ws.binaryType = "arraybuffer";
 
-// === RMS calculation (silence detection) ===
-function calcRMS(buffer) {
-  let sumSq = 0;
-  const samples = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2);
-  for (let i = 0; i < samples.length; i++) {
-    const s = samples[i] / 32768;
-    sumSq += s * s;
-  }
-  return Math.sqrt(sumSq / samples.length);
-}
+  ws.on("open", () => console.log("[WS] Connected"));
 
-// === Stream endpoint (POST 16-bit PCM) ===
-app.post('/stream', express.raw({ type: 'application/octet-stream', limit: '5mb' }), async (req, res) => {
-  const id = 'default'; // no client ID, single shared buffer
-  const sampleRate = parseInt(req.query.sample_rate || '16000', 10);
+  ws.on("message", (data, isBinary) => {
+    if (!isBinary) {
+      try {
+        const txt = data.toString();
+        lastWsResponse = txt; // overwrite previous
+        console.log("[WS] Received JSON response (len:", txt.length + ")");
 
-  if (!sessions.has(id)) {
-    sessions.set(id, {
-      audio: [],
-      lastHeard: Date.now(),
-      startedTalking: false,
-      rmsActiveTime: 0,
-      sampleRate,
-    });
-  }
+        // Reset the 1s clear timer whenever a new response arrives
+        if (clearTimeoutHandle) clearTimeout(clearTimeoutHandle);
+        clearTimeoutHandle = setTimeout(() => {
+          if (lastWsResponse) {
+            console.log("[CLEANUP] Clearing last WS response");
+            lastWsResponse = null;
+          }
+        }, 1000);
 
-  const session = sessions.get(id);
-  const chunk = Buffer.from(req.body);
-  const rms = calcRMS(chunk);
-  const now = Date.now();
-
-  if (rms > 0.02) {
-    session.lastHeard = now;
-    session.audio.push(chunk);
-    session.startedTalking = true;
-    session.rmsActiveTime += chunk.length / (sampleRate * 2) * 1000; // ms
-  } else {
-    // Keep first ~2s to avoid cutting start
-    if (!session.startedTalking || session.rmsActiveTime < 2000) {
-      session.audio.push(chunk);
-      session.lastHeard = now;
-    }
-  }
-
-  // Silence detected
-  if (session.startedTalking && now - session.lastHeard > SILENCE_MS) {
-    console.log(`[${id}] 🔇 Silence detected — finalizing`);
-    finalizeAndTranscribe(id);
-  }
-
-  res.json({ ok: true, rms });
-});
-
-// === Transcript GET endpoint ===
-app.get('/transcript', (req, res) => {
-  const id = 'default';
-  const transcript = transcripts.get(id);
-  if (!transcript) {
-    return res.json({ transcript: '', ready: false });
-  }
-  res.json({ transcript, ready: true });
-});
-
-// === Manual finalize trigger (optional) ===
-app.get('/finalize', (req, res) => {
-  const id = 'default';
-  if (!sessions.has(id)) return res.status(404).send('No active session');
-  finalizeAndTranscribe(id);
-  res.send('Finalizing...');
-});
-
-// === Finalize + send to Deepgram ===
-async function finalizeAndTranscribe(id) {
-  const session = sessions.get(id);
-  if (!session) return;
-  sessions.delete(id);
-
-  if (!session.audio.length) return console.log(`[${id}] No audio to process`);
-
-  const tmpFile = path.join(tmpdir(), `audio_${id}_${Date.now()}.raw`);
-  fs.writeFileSync(tmpFile, Buffer.concat(session.audio));
-
-  try {
-    const fileData = fs.readFileSync(tmpFile);
-    const resp = await fetch(
-      `https://api.deepgram.com/v1/listen?model=${DG_MODEL}&language=${DG_LANG}&encoding=linear16&sample_rate=${session.sampleRate}`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
-          'Content-Type': 'application/octet-stream',
-        },
-        body: fileData,
+      } catch (err) {
+        console.warn("[WS] Failed to parse incoming message:", err.message);
       }
-    );
+    } else {
+      console.log("[WS] Ignored binary message from upstream (not expected)");
+    }
+  });
 
-    const json = await resp.json();
-    const transcript = json?.results?.channels?.[0]?.alternatives?.[0]?.transcript || '';
-    console.log(`[${id}] 🗣️ Transcript:`, transcript);
+  ws.on("close", (code) => {
+    console.log(`[WS] Closed (${code}) - reconnecting in 2s`);
+    setTimeout(connectWS, 2000);
+  });
 
-    // Save transcript for /transcript access
-    transcripts.set(id, transcript);
-
-    // Auto-clear after 5 seconds
-    setTimeout(() => transcripts.delete(id), 5000);
-
-  } catch (err) {
-    console.error(`[${id}] Deepgram error:`, err);
-  } finally {
-    try { fs.unlinkSync(tmpFile); } catch {}
-  }
+  ws.on("error", (err) => {
+    console.error("[WS] Error:", err?.message || err);
+  });
 }
+connectWS();
 
-// === Serve browser test page ===
-app.get('/', (req, res) => {
-  res.sendFile(path.resolve('./public/index.html'));
+// === POST /stream ===
+app.post("/stream", (req, res) => {
+  const clientId = req.headers["x-client-id"] || req.query.clientId || null;
+  const chunks = [];
+  let totalBytes = 0;
+
+  req.on("data", (chunk) => {
+    const buf = Buffer.from(chunk);
+    chunks.push(buf);
+    totalBytes += buf.length;
+  });
+
+  req.on("end", () => {
+    const body = Buffer.concat(chunks, totalBytes);
+    if (!body || body.length === 0) {
+      console.log("[HTTP] /stream received empty body");
+      return res.status(400).send("Empty body");
+    }
+
+    console.log(`[HTTP] /stream received ${body.length} bytes${clientId ? " for clientId="+clientId : ""}`);
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(body, { binary: true }, (err) => {
+        if (err) console.error("[WS] send error:", err.message || err);
+      });
+      res.status(200).json({ ok: true, bytes: body.length, clientId });
+    } else {
+      console.log("[HTTP] WebSocket not connected");
+      res.status(503).send("WebSocket not connected");
+    }
+  });
+
+  req.on("error", (err) => {
+    console.error("[HTTP] request error:", err.message || err);
+    res.status(500).send("Request error");
+  });
 });
 
-app.use(express.static('public'));
+// === GET /poll ===
+app.get("/poll", (req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  if (lastWsResponse) {
+    const out = [lastWsResponse];
+    lastWsResponse = null; // clear after serving
+    res.status(200).send(JSON.stringify(out));
+  } else {
+    res.status(200).send("[]");
+  }
+});
+
+// === Health ===
+app.get("/health", (req, res) => {
+  res.json({ ok: true, wsConnected: ws && ws.readyState === WebSocket.OPEN });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT} (WS -> ${WS_TARGET_URL})`);
+});
