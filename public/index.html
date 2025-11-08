@@ -1,93 +1,62 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<title>dubix stt site</title>
+<meta charset="UTF-8">
+<title>dubix speech to text site</title>
 <style>
-body { font-family: sans-serif; padding: 1rem; max-width: 600px; margin: auto; text-align: center; }
-button { margin: 0.5rem; padding: 0.5rem 1rem; font-size: 16px; }
-#log { text-align: left; background: #111; color: #0f0; padding: 1rem; height: 200px; overflow-y: auto; white-space: pre-wrap; }
+body { font-family:sans-serif; max-width:600px; margin:1rem auto; text-align:center }
+button { padding:10px 15px; margin:5px; }
+#log { text-align:left; white-space:pre-wrap; background:#111; color:#0f0; padding:1em; height:200px; overflow:auto; }
 </style>
 </head>
 <body>
-<h2>🎙️ dubix stt</h2>
-<button id="start">Start Mic Stream</button>
-<button id="stop">Stop</button>
-<pre id="log"></pre>
+<h2>speech to text by dubix</h2>
+<button id="startBtn">🎙 Start Stream</button>
+<button id="stopBtn">🛑 Stop Stream</button>
+<div id="log"></div>
 
 <script>
-const log = (m) => {
-  document.getElementById('log').textContent += m + "\n";
-};
+let mediaRecorder;
+let interval;
+const logEl = document.getElementById("log");
 
-let audioContext, processor, micStream, stopped = false;
-const STREAM_URL = '/stream?sample_rate=16000';
-const POLL_URL = '/transcript';
+function log(t){ logEl.textContent += t + "\n"; logEl.scrollTop = logEl.scrollHeight; }
 
-async function start() {
-  stopped = false;
-  log("🎧 Requesting mic...");
+document.getElementById("startBtn").onclick = async () => {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  audioContext = new AudioContext({ sampleRate: 16000 });
-  micStream = audioContext.createMediaStreamSource(stream);
-  
-  const workletCode = `
-    class PCMWorklet extends AudioWorkletProcessor {
-      constructor() { super(); this.buf = []; this.lastSend = 0; }
-      process(inputs) {
-        const input = inputs[0][0];
-        if (!input) return true;
-        const pcm = new Int16Array(input.length);
-        for (let i = 0; i < input.length; i++) {
-          let s = Math.max(-1, Math.min(1, input[i]));
-          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-        this.port.postMessage(pcm.buffer);
-        return true;
-      }
-    }
-    registerProcessor('pcm-worklet', PCMWorklet);
-  `;
-  
-  const blob = new Blob([workletCode], { type: 'application/javascript' });
-  const url = URL.createObjectURL(blob);
-  await audioContext.audioWorklet.addModule(url);
-  processor = new AudioWorkletNode(audioContext, 'pcm-worklet');
-  processor.port.onmessage = async (e) => {
-    if (stopped) return;
-    try {
-      await fetch(STREAM_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: e.data
-      });
-    } catch (err) { log("⚠️ " + err.message); }
+  const ctx = new AudioContext({ sampleRate: 16000 });
+  const src = ctx.createMediaStreamSource(stream);
+
+  // ✅ Changed buffer size from 4096 to 512
+  const processor = ctx.createScriptProcessor(4096, 1, 1);
+
+  src.connect(processor);
+  processor.connect(ctx.destination);
+  log("🎤 Started capturing...");
+
+  processor.onaudioprocess = e => {
+    const input = e.inputBuffer.getChannelData(0);
+    const pcm16 = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) pcm16[i] = input[i] * 0x7fff;
+    fetch("/stream", { method: "POST", body: pcm16.buffer });
   };
-  micStream.connect(processor).connect(audioContext.destination);
-  log("🎤 Streaming started...");
-  pollTranscript();
-}
 
-function stop() {
-  stopped = true;
-  if (audioContext) audioContext.close();
-  log("🛑 Mic stopped.");
-}
-
-async function pollTranscript() {
-  if (stopped) return;
-  try {
-    const res = await fetch(POLL_URL);
-    const j = await res.json();
-    if (j.ready && j.transcript) {
-      log("🗣️ " + j.transcript);
+  interval = setInterval(async () => {
+    const res = await fetch("/poll");
+    const json = await res.json();
+    if (json.length > 0) {
+      log("🔁 WS Response: " + JSON.stringify(json, null, 2));
     }
-  } catch (err) {}
-  setTimeout(pollTranscript, 1000);
-}
+  }, 150);
 
-document.getElementById('start').onclick = start;
-document.getElementById('stop').onclick = stop;
+  document.getElementById("stopBtn").onclick = () => {
+    clearInterval(interval);
+    processor.disconnect();
+    src.disconnect();
+    ctx.close();
+    log("🛑 Stopped.");
+  };
+};
 </script>
 </body>
 </html>
