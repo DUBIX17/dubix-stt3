@@ -1,34 +1,12 @@
 {
-  "name": "deepgram-https-stream-server",
+  "name": "esp32-audio-proxy",
   "version": "1.0.0",
-  "description": "HTTPS audio stream server with Deepgram STT and AudioWorklet browser tester (ESP32 compatible).",
   "type": "module",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
-  },
   "dependencies": {
-    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2"
+    "ws": "^8.17.0"
   },
-  "devDependencies": {
-    "nodemon": "^3.1.7"
-  },
-  "engines": {
-    "node": ">=18.x"
-  },
-  "keywords": [
-    "deepgram",
-    "stt",
-    "speech-to-text",
-    "esp32",
-    "audio",
-    "https",
-    "express",
-    "audioworklet"
-  ],
-  "author": "Dubix",
-  "license": "MIT"
+  "scripts": {
+    "start": "node server.js"
+  }
 }
